@@ -1,13 +1,8 @@
+/* Copyright 2001,2002 Roger Dingledine, Matej Pfajfar. */
+/* See LICENSE for licensing information */
+/* $Id$ */
 
 #include "or.h"
-
-connection_t *connection_op_new(void) {
-  return connection_new(CONN_TYPE_OP);
-}
-
-connection_t *connection_op_listener_new(void) {
-  return connection_new(CONN_TYPE_OP_LISTENER);
-}
 
 int connection_op_process_inbuf(connection_t *conn) {
 
@@ -89,12 +84,8 @@ int op_handshake_process_keys(connection_t *conn) {
   EVP_EncryptInit(&conn->b_ctx, EVP_des_ofb(), conn->b_session_key, conn->b_session_iv);
   EVP_DecryptInit(&conn->f_ctx, EVP_des_ofb(), conn->f_session_key, conn->f_session_iv);
 
-#if 0
-  /* FIXME must choose conn->aci here? What does it mean for a connection to have an aci? */
-  log(LOG_DEBUG,"new_entry_connection : Chosen ACI %u.",conn->aci);
-#endif
-
   conn->state = OP_CONN_STATE_OPEN;
+  connection_init_timeval(conn);
   connection_watch_events(conn, POLLIN);
 
   return 0;
@@ -107,7 +98,7 @@ int connection_op_finished_flushing(connection_t *conn) {
   switch(conn->state) {
     case OP_CONN_STATE_OPEN:
       /* FIXME down the road, we'll clear out circuits that are pending to close */
-      connection_watch_events(conn, POLLIN);
+      connection_stop_writing(conn);
       return 0;
     default:
       log(LOG_DEBUG,"Bug: connection_op_finished_flushing() called in unexpected state.");
