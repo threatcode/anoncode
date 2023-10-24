@@ -8,8 +8,22 @@
 /*
  * Changes :
  * $Log$
- * Revision 1.1  2002/06/26 22:45:50  arma
- * Initial revision
+ * Revision 1.5  2002/07/20 02:01:18  arma
+ * bugfixes: don't hang waiting for new children to die; accept HTTP/1.1
+ *
+ * Revision 1.4  2002/07/19 18:48:19  arma
+ * slightly less noisy
+ *
+ * Revision 1.3  2002/07/12 18:14:16  montrose
+ * removed loglevel from global namespace. severity level is set using log() with a NULL format argument now. example: log(LOG_ERR,NULL);
+ *
+ * Revision 1.2  2002/07/02 09:16:16  arma
+ * httpap now prepends dest_addr and dest_port strings with their length.
+ *
+ * also, it now sets the listening socket option SO_REUSEADDR
+ *
+ * Revision 1.1.1.1  2002/06/26 22:45:50  arma
+ * initial commit: current code
  *
  * Revision 1.4  2002/06/14 20:45:26  mp292
  * Extra debugging message.
@@ -53,7 +67,6 @@
 #include "httpap.h"
 #include "http.h"
 
-int loglevel = LOG_ERR;
 struct timeval conn_tout;
 struct timeval *conn_toutp = &conn_tout;
 
@@ -87,8 +100,10 @@ void print_usage()
 /* used for reaping zombie processes */
 void sigchld_handler(int s)
 {
-  while (wait(NULL) > 0);
-  connections--;
+  while((waitpid (-1, NULL, WNOHANG)) > 0) {
+//  while (wait(NULL) > 0);
+    connections--;
+  }
 }
 
 int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in remote, uint16_t op_port)
@@ -102,6 +117,7 @@ int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in re
   unsigned char *line; /* one line of input */
   int len; /* length of the line */
   
+  uint16_t stringlen; /* used for sending how long a string is before the actual string */
   unsigned char *http_ver; /* HTTP version of the incoming request */
   unsigned char *addr; /* destination address */
   unsigned char *port; /* destination port */
@@ -166,12 +182,12 @@ int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in re
     return -1;
   }
   log(LOG_DEBUG,"handle_connection : Client's version is : %s.",http_ver);
-  if (strcmp(http_ver, HTTPAP_VERSION)) /* not supported */
-  {
-    log(LOG_DEBUG,"handle_connection : Client's version is %s, I only support HTTP/1.0.",http_ver);
-    write_tout(new_sock, HTTPAP_STATUS_LINE_VERSION_NOT_SUPPORTED, strlen(HTTPAP_STATUS_LINE_VERSION_NOT_SUPPORTED), conn_toutp);
-    return -1;
-  }
+//  if (strcmp(http_ver, HTTPAP_VERSION)) /* not supported */
+//  {
+//    log(LOG_DEBUG,"handle_connection : Client's version is %s, I only support HTTP/1.0.",http_ver);
+//    write_tout(new_sock, HTTPAP_STATUS_LINE_VERSION_NOT_SUPPORTED, strlen(HTTPAP_STATUS_LINE_VERSION_NOT_SUPPORTED), conn_toutp);
+//    return -1;
+//  }
   free((void *)http_ver);
   
   /* extract the destination address and port */
@@ -261,15 +277,23 @@ int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in re
     close(sop);
     return -1;    
   }
-  retval = write_tout(sop,addr,strlen(addr)+1, conn_toutp);
-  if (retval < strlen(addr)+1)
+  /* patch so the OP doesn't have to guess how long the string is. Note
+   * we're *no longer* sending the NULL character. */
+  stringlen = htons(strlen(addr));
+  write_tout(sop,(char *)&stringlen,sizeof(uint16_t), conn_toutp);
+  retval = write_tout(sop,addr,strlen(addr), conn_toutp);
+  if (retval < strlen(addr))
   {
     write_tout(new_sock, HTTPAP_STATUS_LINE_UNAVAILABLE, strlen(HTTPAP_STATUS_LINE_UNAVAILABLE), conn_toutp);
     close(sop);
     return -1;
   }
-  retval = write_tout(sop,port,strlen(port)+1, conn_toutp);
-  if (retval < strlen(port)+1)
+  /* patch so the OP doesn't have to guess how long the string is. Note
+   * we're *no longer* sending the NULL character. */
+  stringlen = htons(strlen(port));
+  write_tout(sop,(char *)&stringlen,sizeof(short int), conn_toutp);
+  retval = write_tout(sop,port,strlen(port), conn_toutp);
+  if (retval < strlen(port))
   {
     write_tout(new_sock, HTTPAP_STATUS_LINE_UNAVAILABLE, strlen(HTTPAP_STATUS_LINE_UNAVAILABLE), conn_toutp);
     close(sop);
@@ -401,7 +425,7 @@ int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in re
 	  close(new_sock);
 	  break;
 	}
-	log(LOG_DEBUG,"handle_connection() : Received %u bytes from the onion proxy.",retval);
+//	log(LOG_DEBUG,"handle_connection() : Received %u bytes from the onion proxy.",retval);
 	
 	retval = write_tout(new_sock, buf, retval, conn_toutp);
 	if (retval <= 0)
@@ -450,9 +474,11 @@ int handle_connection(int new_sock, struct hostent *local, struct sockaddr_in re
 
 int main(int argc, char *argv[])
 {
+  int loglevel = LOG_DEBUG;
   int retval = 0;
   
   char c; /* command-line option */
+  int one=1;
   
   /* configuration file */
   char *conf_filename = NULL;
@@ -507,7 +533,7 @@ int main(int argc, char *argv[])
       print_usage();
       return 0;
       break;
-     case 'l':
+    case 'l':
       if (!strcmp(optarg,"emerg"))
 	loglevel = LOG_EMERG;
       else if (!strcmp(optarg,"alert"))
@@ -544,6 +570,8 @@ int main(int argc, char *argv[])
     }
   }
   
+  log(loglevel,NULL);  /* assign severity level for logger */
+
   /* the -f option is mandatory */
   if (conf_filename == NULL)
   {
@@ -628,6 +656,9 @@ int main(int argc, char *argv[])
   local.sin_family=AF_INET;
   local.sin_addr.s_addr = INADDR_ANY;
   local.sin_port=p;
+
+  setsockopt(request_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
   /* bind it to the socket */
   retval = bind(request_sock,(struct sockaddr *)&local, sizeof(local));
   if (retval < 0)

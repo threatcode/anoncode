@@ -8,6 +8,15 @@
 /*
  * Changes :
  * $Log$
+ * Revision 1.5  2002/07/15 19:05:12  montrose
+ * bug-fix. poptReadDefaultOptions() should find and load ~/.<cmd>rc files now.
+ *
+ * Revision 1.4  2002/07/09 19:51:41  montrose
+ * Miscellaneous bug fixes / activated "make check" for src/or
+ *
+ * Revision 1.3  2002/07/03 16:31:22  montrose
+ * Added getoptions() and made minor adjustment to poptReadDefaultOptions()
+ *
  * Revision 1.2  2002/06/28 18:14:55  montrose
  * Added poptReadOptions() and poptReadDefaultOptions()
  *
@@ -358,19 +367,17 @@ RETURN VALUE: INT_MIN = problem opening config file, else standard poptGetNextOp
 **/
 {
    FILE *fp;
-   int argc, c;
+   int argc, c, n;
    char **argv;
-   char line[256];
+   char line[1024];
    line[0] = line[1] = '-';  /* prepend expected long name option flag */
-   fp = open_config(fname);
+   fp = fopen(fname,"r");
    if ( fp == NULL ) return INT_MIN;
    c = 0;
-   /**
-   this loop skips over all leading whitespace and blank lines then returns all text
-   from that point to the next newline.
-   **/
-   while ( c >= -1 && fscanf(fp,"%*[ \n]%[^\n]",&line[2]) == 1 )
+   while ( c >= -1 )
    {
+      if ( fscanf(fp,"%*[ \n]%n",&n) == EOF ) break;     /* eat leading whitespace */
+      if ( fscanf(fp, "%[^\n]",&line[2]) == EOF ) break; /* read a line */
       switch ( line[2] )
       {
       case '#':   /* comments begin with this */
@@ -383,7 +390,7 @@ RETURN VALUE: INT_MIN = problem opening config file, else standard poptGetNextOp
          c = poptGetNextOpt(optCon);                  /* interpret option read from config file */
       }
    }
-   close_config(fp);
+   fclose(fp);
    return c;
 }
 
@@ -399,9 +406,10 @@ RETURN VALUE: same as poptReadOptions()
    c = poptReadOptions(optCon,fname);
    if ( c == INT_MIN || c >= -1 )
    {
-      sprintf(fname,"~/.%src",cmd);
+      sprintf(fname,"%s/.%src",getenv("HOME"),cmd);
       c = poptReadOptions(optCon,fname);
    }
-   return c;
+   return (c == INT_MIN) ? -1 : c;
 }
+
 

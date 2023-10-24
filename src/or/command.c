@@ -1,10 +1,10 @@
+/* Copyright 2001,2002 Roger Dingledine, Matej Pfajfar. */
+/* See LICENSE for licensing information */
+/* $Id$ */
 
 #include "or.h"
 
 void command_process_cell(cell_t *cell, connection_t *conn) {
-
-  if(check_sane_cell(cell) < 0)
-    return;
 
   switch(cell->command) {
     case CELL_PADDING:
@@ -18,6 +18,12 @@ void command_process_cell(cell_t *cell, connection_t *conn) {
       break;
     case CELL_DESTROY:
       command_process_destroy_cell(cell, conn);
+      break;
+    case CELL_SENDME:
+      command_process_sendme_cell(cell, conn);
+      break;
+    default:
+      log(LOG_DEBUG,"Cell of unknown type (%d) received. Dropping.", cell->command);
       break;
   }
 }
@@ -40,10 +46,9 @@ void command_process_create_cell(cell_t *cell, connection_t *conn) {
   if(!circ) { /* if it's not there, create it */
     circ = circuit_new(cell->aci, conn);
     circ->state = CIRCUIT_STATE_OPEN_WAIT;
-    memcpy((void *)&circ->onionlen,(void *)cell->payload, 4);
-    circ->onionlen = ntohl(circ->onionlen);
+    circ->onionlen = ntohl(*(int*)cell->payload);
     log(LOG_DEBUG,"command_process_create_cell():  Onion length is %u.",circ->onionlen);
-    if(circ->onionlen > 50000) { /* too big */
+    if(circ->onionlen > 50000 || circ->onionlen < 1) { /* too big or too small */
       log(LOG_DEBUG,"That's ludicrous. Closing.");
       circuit_close(circ);
       return;
@@ -91,14 +96,22 @@ void command_process_create_cell(cell_t *cell, connection_t *conn) {
   }
 
   if(circ->n_addr && circ->n_port) { /* must send create cells to the next router */
-    n_conn = connection_get_by_addr_port(circ->n_addr,circ->n_port);
+    n_conn = connection_twin_get_by_addr_port(circ->n_addr,circ->n_port);
     if(!n_conn || n_conn->type != CONN_TYPE_OR) {
       /* i've disabled making connections through OPs, but it's definitely
        * possible here. I'm not sure if it would be a bug or a feature. -RD
        */
+      /* note also that this will close circuits where the onion has the same
+       * router twice in a row in the path. i think that's ok. -RD
+       */
       log(LOG_DEBUG,"command_process_create_cell(): Next router not connected. Closing.");
       circuit_close(circ);
+      return;
     }
+
+    circ->n_addr = n_conn->addr; /* these are different if we found a twin instead */
+    circ->n_port = n_conn->port;
+
     circ->n_conn = n_conn;
     log(LOG_DEBUG,"command_process_create_cell(): n_conn is %s:%u",n_conn->address,ntohs(n_conn->port));
 
@@ -132,15 +145,17 @@ void command_process_create_cell(cell_t *cell, connection_t *conn) {
     free((void *)cellbuf);
     return;
 
-  } else { /* this is destined for an app */
-    log(LOG_DEBUG,"command_process_create_cell(): Creating new application connection.");
-    n_conn = connection_new(CONN_TYPE_APP);
+  } else { /* this is destined for an exit */
+    log(LOG_DEBUG,"command_process_create_cell(): Creating new exit connection.");
+    n_conn = connection_new(CONN_TYPE_EXIT);
     if(!n_conn) {
       log(LOG_DEBUG,"command_process_create_cell(): connection_new failed. Closing.");
       circuit_close(circ);
       return;
     }
-    n_conn->state = APP_CONN_STATE_CONNECTING_WAIT;
+    n_conn->state = EXIT_CONN_STATE_CONNECTING_WAIT;
+    n_conn->receiver_bucket = -1; /* edge connections don't do receiver buckets */
+    n_conn->bandwidth = -1;
     n_conn->s = -1; /* not yet valid */
     if(connection_add(n_conn) < 0) { /* no space, forget it */
       log(LOG_DEBUG,"command_process_create_cell(): connection_add failed. Closing.");
@@ -151,18 +166,67 @@ void command_process_create_cell(cell_t *cell, connection_t *conn) {
     circ->n_conn = n_conn;
     return;
   }
+}
 
+void command_process_sendme_cell(cell_t *cell, connection_t *conn) {
+  circuit_t *circ;
+
+  circ = circuit_get_by_aci_conn(cell->aci, conn);
+
+  if(!circ) {
+    log(LOG_DEBUG,"command_process_sendme_cell(): unknown circuit %d. Dropping.", cell->aci);
+    return;
+  }
+
+  if(circ->state == CIRCUIT_STATE_OPEN_WAIT) {
+    log(LOG_DEBUG,"command_process_sendme_cell(): circuit in open_wait. Dropping.");
+    return;
+  }
+  if(circ->state == CIRCUIT_STATE_OR_WAIT) {
+    log(LOG_DEBUG,"command_process_sendme_cell(): circuit in or_wait. Dropping.");
+    return;
+  }
+
+  /* at this point both circ->n_conn and circ->p_conn are guaranteed to be set */
+
+  assert(cell->length == RECEIVE_WINDOW_INCREMENT);
+
+  if(cell->aci == circ->p_aci) { /* it's an outgoing cell */
+    circ->n_receive_window += cell->length;
+    log(LOG_DEBUG,"connection_process_sendme_cell(): n_receive_window for aci %d is %d.",circ->n_aci,circ->n_receive_window);
+    if(circ->n_conn->type == CONN_TYPE_EXIT) {
+      connection_start_reading(circ->n_conn);
+      connection_package_raw_inbuf(circ->n_conn); /* handle whatever might still be on the inbuf */
+    } else {
+      cell->aci = circ->n_aci; /* switch it */
+      if(connection_write_cell_to_buf(cell, circ->n_conn) < 0) { /* (clobbers cell) */
+        circuit_close(circ);
+        return;
+      }
+    }
+  } else { /* it's an ingoing cell */
+    circ->p_receive_window += cell->length;
+    log(LOG_DEBUG,"connection_process_sendme_cell(): p_receive_window for aci %d is %d.",circ->p_aci,circ->p_receive_window);
+    if(circ->p_conn->type == CONN_TYPE_AP) {
+      connection_start_reading(circ->p_conn);
+      connection_package_raw_inbuf(circ->p_conn); /* handle whatever might still be on the inbuf */
+    } else {
+      cell->aci = circ->p_aci; /* switch it */
+      if(connection_write_cell_to_buf(cell, circ->p_conn) < 0) { /* (clobbers cell) */
+        circuit_close(circ);
+        return;
+      }
+    }
+  } 
 }
 
 void command_process_data_cell(cell_t *cell, connection_t *conn) {
   circuit_t *circ;
 
-  /* FIXME do something with 'close' state, here */
-
   circ = circuit_get_by_aci_conn(cell->aci, conn);
 
   if(!circ) {
-    log(LOG_DEBUG,"command_process_data_cell(): received DATA cell for unknown circuit. Dropping.");
+    log(LOG_DEBUG,"command_process_data_cell(): unknown circuit %d. Dropping.", cell->aci);
     return;
   }
 
@@ -170,11 +234,21 @@ void command_process_data_cell(cell_t *cell, connection_t *conn) {
     log(LOG_DEBUG,"command_process_data_cell(): circuit in open_wait. Dropping data cell.");
     return;
   }
+  if(circ->state == CIRCUIT_STATE_OR_WAIT) {
+    log(LOG_DEBUG,"command_process_data_cell(): circuit in or_wait. Dropping data cell.");
+    return;
+  }
 
   /* at this point both circ->n_conn and circ->p_conn are guaranteed to be set */
 
   if(cell->aci == circ->p_aci) { /* it's an outgoing cell */
     cell->aci = circ->n_aci; /* switch it */
+    if(--circ->p_receive_window < 0) { /* is it less than 0 after decrement? */
+      log(LOG_DEBUG,"connection_process_data_cell(): Too many data cells on aci %d. Closing.", circ->p_aci);
+      circuit_close(circ);
+      return;
+    }
+    log(LOG_DEBUG,"connection_process_data_cell(): p_receive_window for aci %d is %d.",circ->p_aci,circ->p_receive_window);
     if(circuit_deliver_data_cell(cell, circ, circ->n_conn, 'd') < 0) {
       log(LOG_DEBUG,"command_process_data_cell(): circuit_deliver_data_cell (forward) failed. Closing.");
       circuit_close(circ);
@@ -182,10 +256,24 @@ void command_process_data_cell(cell_t *cell, connection_t *conn) {
     }
   } else { /* it's an ingoing cell */
     cell->aci = circ->p_aci; /* switch it */
-    if(circuit_deliver_data_cell(cell, circ, circ->p_conn, 'e') < 0) {
-      log(LOG_DEBUG,"command_process_data_cell(): circuit_deliver_data_cell (backward) failed. Closing.");
+    if(--circ->n_receive_window < 0) { /* is it less than 0 after decrement? */
+      log(LOG_DEBUG,"connection_process_data_cell(): Too many data cells on aci %d. Closing.", circ->n_aci);
       circuit_close(circ);
       return;
+    }
+    log(LOG_DEBUG,"connection_process_data_cell(): n_receive_window for aci %d is %d.",circ->n_aci,circ->n_receive_window);
+    if(circ->p_conn->type == CONN_TYPE_AP) { /* we want to decrypt, not encrypt */
+      if(circuit_deliver_data_cell(cell, circ, circ->p_conn, 'd') < 0) {
+        log(LOG_DEBUG,"command_process_data_cell(): circuit_deliver_data_cell (backward to AP) failed. Closing.");
+        circuit_close(circ);
+        return;
+      }
+    } else {
+      if(circuit_deliver_data_cell(cell, circ, circ->p_conn, 'e') < 0) {
+        log(LOG_DEBUG,"command_process_data_cell(): circuit_deliver_data_cell (backward) failed. Closing.");
+        circuit_close(circ);
+        return;
+      }
     }
   }
 }
@@ -196,7 +284,7 @@ void command_process_destroy_cell(cell_t *cell, connection_t *conn) {
   circ = circuit_get_by_aci_conn(cell->aci, conn);
 
   if(!circ) {
-    log(LOG_DEBUG,"command_process_destroy_cell(): received DESTROY cell for unknown circuit. Dropping.");
+    log(LOG_DEBUG,"command_process_destroy_cell(): unknown circuit %d. Dropping.", cell->aci);
     return;
   }
 
@@ -207,6 +295,5 @@ void command_process_destroy_cell(cell_t *cell, connection_t *conn) {
   if(cell->aci == circ->n_aci) /* the destroy came from ahead */
     connection_send_destroy(circ->p_aci, circ->p_conn);
   circuit_free(circ);
-
 }
 
