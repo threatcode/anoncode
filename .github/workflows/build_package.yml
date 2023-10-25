@@ -1,0 +1,48 @@
+name: Build and Publish Debian Package
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y dpkg-dev wget
+
+    - name: Build and install the .deb package
+      run: |
+        # Build the deb package
+        sudo dpkg-deb -b  anoncode-deb-src/  anoncode.deb
+        # Install the .deb package
+        sudo dpkg -i  anoncode.deb || (sudo apt-get -f install && sudo dpkg -i  anoncode.deb)
+
+    - name: Get version from control file
+      run: |
+        VERSION=$(grep '^Version:'  anoncode-deb-src/DEBIAN/control | cut -d' ' -f2)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+    - name: Set up GitHub context
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+
+    - name: Create and publish release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VERSION="${{ env.VERSION }}"
+        RELEASE_NAME=" anoncode-$VERSION"
+        TAG_NAME="v$VERSION"
+        echo "Creating release: $RELEASE_NAME (tag: $TAG_NAME)"
+        gh release create "$TAG_NAME" -t "$RELEASE_NAME" -n "Release for version $VERSION"  anoncode.deb
+
+
