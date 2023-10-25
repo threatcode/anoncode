@@ -1,7 +1,0 @@
-
-SUBDIRS = src
-
-DIST_SUBDIRS = src
-
-EXTRA_DIST = TODO HACKING FAQ
-
