@@ -1,7 +1,3 @@
-# kali-anonstealth
-
-ParrotSec's anoncode and stealth, ported to work with Kali Linux.
-
 ## How to use this repo
 
 This repo contains the sources of both the anoncode and pandora packages from ParrotSec combined into one.
